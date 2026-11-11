@@ -1,0 +1,252 @@
+// RecommendedExtensionsView.swift
+// OpenClip
+//
+// Compact "recommended extensions" picker used by the first-launch onboarding flow.
+// Shows the store's top extensions in card-based rows with live Install/Remove buttons.
+import SwiftUI
+import Core
+
+@MainActor
+public struct RecommendedExtensionsView: View {
+    /// Curated featured extensions in priority order
+    private static var curatedRecommendedIDs: [String] {
+        ExtensionsStoreViewModel.curatedFeaturedIDs
+    }
+
+    private static var fallbackItems: [ExtensionItem] {
+        ExtensionsStoreViewModel.fallbackFeaturedItems
+    }
+
+    @StateObject private var viewModel = ExtensionsStoreViewModel()
+    @ObservedObject private var coordinator = ActionCoordinator.shared
+
+    public init() {}
+
+    private var recommended: [ExtensionItem] {
+        if !viewModel.featuredItems.isEmpty {
+            return Array(viewModel.featuredItems.prefix(4))
+        }
+        if !viewModel.extensions.isEmpty {
+            let byID = Dictionary(viewModel.extensions.map { ($0.id.lowercased(), $0) },
+                                  uniquingKeysWith: { first, _ in first })
+            let curated = Self.curatedRecommendedIDs.compactMap { byID[$0.lowercased()] }
+            var chosen = Set(curated.map { $0.id.lowercased() })
+            let rest = viewModel.extensions
+                .filter { chosen.insert($0.id.lowercased()).inserted }
+                .sorted { $0.downloadCount > $1.downloadCount }
+            return Array((curated + rest).prefix(4))
+        }
+        return []
+    }
+
+    public var body: some View {
+        Group {
+            if viewModel.isLoading && recommended.isEmpty {
+                ExtensionsSkeletonList()
+            } else if recommended.isEmpty {
+                VStack(spacing: 8) {
+                    Image(systemName: "wifi.slash")
+                        .font(.system(size: 24))
+                        .foregroundColor(.secondary)
+                    Text(String(localized: "No Internet Connection"))
+                        .font(.headline)
+                        .foregroundColor(.primary)
+                    Text(String(localized: "Unable to load extension recommendations without an active network connection."))
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+                .frame(maxWidth: .infinity, minHeight: 100)
+                .padding(.vertical, 12)
+            } else {
+                VStack(spacing: 8) {
+                    ForEach(recommended) { item in
+                        RecommendedExtensionRow(item: item)
+                    }
+                }
+            }
+        }
+        .task {
+            await viewModel.loadAll(limit: Constants.storeFullCatalogLimit)
+        }
+    }
+}
+
+@MainActor
+private struct RecommendedExtensionRow: View {
+    let item: ExtensionItem
+    @ObservedObject private var coordinator = ActionCoordinator.shared
+    @State private var isInstalling = false
+    @State private var isUninstalling = false
+    @State private var installError: String? = nil
+
+    private var matchingInstalledAction: (any Action)? {
+        coordinator.actions.first { action in
+            let actID = action.id.lowercased()
+            let itemID = item.id.lowercased()
+            return actID == itemID || actID.hasPrefix(itemID + ".")
+        }
+    }
+
+    private var isInstalled: Bool {
+        matchingInstalledAction != nil
+    }
+
+    private var bareSymbolName: String {
+        var icon = item.icon
+        if icon.hasPrefix("symbol:") { icon = String(icon.dropFirst("symbol:".count)) }
+        return icon.isEmpty ? "puzzlepiece.extension" : icon
+    }
+
+    var body: some View {
+        HStack(spacing: 12) {
+            // Icon
+            ZStack {
+                if let urlString = item.iconURL, let url = URL(string: urlString) {
+                    RemoteTemplateIcon(url: url)
+                        .frame(width: 18, height: 18)
+                        .foregroundColor(.accentColor)
+                } else {
+                    Image(systemName: bareSymbolName)
+                        .symbolRenderingMode(.hierarchical)
+                        .font(.system(size: 16))
+                        .foregroundColor(.accentColor)
+                }
+            }
+            .frame(width: 28, height: 28)
+
+            // Title & Description
+            VStack(alignment: .leading, spacing: 2) {
+                Text(item.name)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(.primary)
+                    .lineLimit(1)
+                Text(item.description)
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+            }
+
+            Spacer(minLength: 8)
+
+            if let err = installError {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 12))
+                    .foregroundColor(.red)
+                    .help(err)
+            }
+
+            // Live Install / Installed state
+            if isInstalled {
+                Label("Installed", systemImage: "checkmark.circle.fill")
+                    .font(.system(size: 11.5, weight: .semibold))
+                    .foregroundColor(.green)
+                    .padding(.trailing, 4)
+            } else {
+                Button {
+                    guard let url = URL(string: item.downloadURL) else {
+                        installError = String(localized: "Invalid download URL.")
+                        return
+                    }
+                    isInstalling = true
+                    installError = nil
+                    Task {
+                        do {
+                            ExtensionManager.shared.prepareInstall(source: "store", packageID: item.id)
+                            _ = try await RemoteExtensionInstaller.shared.installFromRemoteURL(url, extensionID: item.id)
+                            await ExtensionUpdateManager.shared.checkForUpdates()
+                            NotificationCenter.default.post(name: .openClipExtensionsDidChange, object: nil)
+                        } catch {
+                            installError = error.localizedDescription
+                        }
+                        isInstalling = false
+                    }
+                } label: {
+                    if isInstalling {
+                        HStack(spacing: 4) {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text("Installing…")
+                                .font(.system(size: 11, weight: .semibold))
+                        }
+                    } else {
+                        HStack(spacing: 4) {
+                            Image(systemName: "plus")
+                                .font(.system(size: 9.5, weight: .bold))
+                            Text("Install")
+                                .font(.system(size: 11.5, weight: .semibold))
+                        }
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(isInstalling)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(SettingsDesignTokens.sectionCardBackground)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .strokeBorder(SettingsDesignTokens.sectionCardBorder, lineWidth: 1)
+        )
+    }
+}
+
+
+// MARK: - Loading skeleton
+
+/// Placeholder rows shown while the catalog loads: same size and spacing as the real rows, with a
+/// soft highlight sweeping across, so the list doesn't jump when the content arrives.
+private struct ExtensionsSkeletonList: View {
+    @State private var sweep = false
+
+    var body: some View {
+        VStack(spacing: 8) {
+            ForEach(0..<4, id: \.self) { _ in skeletonRow }
+        }
+        .overlay {
+            GeometryReader { geo in
+                LinearGradient(
+                    colors: [.clear, Color.white.opacity(0.14), .clear],
+                    startPoint: .leading, endPoint: .trailing
+                )
+                .frame(width: geo.size.width * 0.4)
+                .offset(x: sweep ? geo.size.width : -geo.size.width * 0.4)
+            }
+            .allowsHitTesting(false)
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .onAppear {
+            withAnimation(.linear(duration: 1.3).repeatForever(autoreverses: false)) { sweep = true }
+        }
+        .accessibilityLabel(String(localized: "Loading extensions"))
+    }
+
+    private var skeletonRow: some View {
+        HStack(spacing: 12) {
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .fill(Color.primary.opacity(0.10))
+                .frame(width: 28, height: 28)
+            VStack(alignment: .leading, spacing: 6) {
+                Capsule().fill(Color.primary.opacity(0.12)).frame(width: 110, height: 9)
+                Capsule().fill(Color.primary.opacity(0.07)).frame(width: 190, height: 7)
+            }
+            Spacer(minLength: 8)
+            Capsule().fill(Color.primary.opacity(0.10)).frame(width: 56, height: 20)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(SettingsDesignTokens.sectionCardBackground)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .strokeBorder(SettingsDesignTokens.sectionCardBorder, lineWidth: 1)
+        )
+    }
+}

@@ -1,0 +1,453 @@
+// CloudAPIProvider.swift
+// OpenClip
+//
+// Implements AI processing by querying cloud-based LLM API endpoints (such as OpenAI or Anthropic).
+import Foundation
+import Core
+
+@MainActor
+public final class CloudAPIProvider: AIProvider {
+    public var type: AIProviderType { .cloud }
+
+    public let apiKey: String
+    public let model: String
+    public let serviceProvider: CloudServiceProvider
+    public let customBaseURL: String
+    /// Replacement for the system prompt's role and behavior rules (Settings → AI → System Prompt);
+    /// nil uses the built-in text.
+    public let customGuidelines: String?
+
+    public init(apiKey: String, model: String, serviceProvider: CloudServiceProvider = .openai, customBaseURL: String = "", customGuidelines: String? = nil) {
+        self.customGuidelines = customGuidelines
+        self.apiKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.model = trimmedModel.isEmpty ? (serviceProvider.defaultModels.first ?? "gpt-5-mini") : trimmedModel
+        self.serviceProvider = serviceProvider
+        self.customBaseURL = customBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    public func processStream(prompt: String, text: String) -> AsyncThrowingStream<String, Error> {
+        let validated: (prompt: String, text: String)
+        do {
+            validated = try AIRequestSupport.validateInput(prompt: prompt, text: text)
+        } catch {
+            return AsyncThrowingStream { $0.finish(throwing: error) }
+        }
+        let systemInstruction = AIRequestSupport.systemPrompt(for: validated.prompt, hasInputText: !validated.text.isEmpty, customGuidelines: customGuidelines)
+        let userContent = AIRequestSupport.userContent(for: validated.text, fallbackPrompt: validated.prompt)
+        return stream(systemPrompt: systemInstruction, messages: [.init(role: .user, content: userContent)])
+    }
+
+    public func processStream(refining conversation: AIConversation, instruction: String, currentText: String) -> AsyncThrowingStream<String, Error> {
+        guard let request = conversation.followUpRequest(instruction: instruction, customGuidelines: customGuidelines) else {
+            return processStream(prompt: conversation.followUpTask(current: instruction), text: currentText)
+        }
+        return stream(systemPrompt: request.system, messages: request.messages)
+    }
+
+    private func stream(systemPrompt systemInstruction: String, messages: [AIChatMessage]) -> AsyncThrowingStream<String, Error> {
+        AsyncThrowingStream { continuation in
+            guard !apiKey.isEmpty else {
+                continuation.finish(throwing: AIError.missingAPIKey)
+                return
+            }
+
+            let streamTask: Task<Void, Never>
+            switch serviceProvider {
+            case .anthropic:
+                streamTask = Task {
+                    do {
+                        for try await chunk in self.streamAnthropic(systemPrompt: systemInstruction, messages: messages) {
+                            continuation.yield(chunk)
+                        }
+                        AIRequestSupport.finishStream(continuation)
+                    } catch {
+                        continuation.finish(throwing: error)
+                    }
+                }
+            case .google:
+                streamTask = Task {
+                    do {
+                        for try await chunk in self.streamGemini(systemPrompt: systemInstruction, messages: messages) {
+                            continuation.yield(chunk)
+                        }
+                        AIRequestSupport.finishStream(continuation)
+                    } catch {
+                        continuation.finish(throwing: error)
+                    }
+                }
+            case .openai, .deepseek, .groq, .openrouter, .opencode, .opencodeGo, .mistral, .xai, .cerebras, .together, .fireworks, .custom:
+                let baseURL = effectiveBaseURL
+                streamTask = Task {
+                    do {
+                        for try await chunk in self.streamOpenAICompatible(systemPrompt: systemInstruction, messages: messages, baseURL: baseURL) {
+                            continuation.yield(chunk)
+                        }
+                        AIRequestSupport.finishStream(continuation)
+                    } catch {
+                        continuation.finish(throwing: error)
+                    }
+                }
+            }
+
+            continuation.onTermination = { _ in
+                streamTask.cancel()
+            }
+        }
+    }
+
+    public static func resolveBaseURL(provider: CloudServiceProvider, customBaseURL: String = "") -> String {
+        let trimmed = customBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty {
+            return trimmed
+        }
+        return provider.defaultBaseURL
+    }
+
+    public var effectiveBaseURL: String {
+        Self.resolveBaseURL(provider: serviceProvider, customBaseURL: customBaseURL)
+    }
+
+    private func isOpenAIReasoningModel(_ model: String) -> Bool {
+        guard serviceProvider == .openai else { return false }
+        let lastComponent = model.split(separator: "/").last.map(String.init) ?? model
+        let lower = lastComponent.lowercased()
+        return lower.hasPrefix("o1") || lower.hasPrefix("o3")
+    }
+
+    /// OpenCode routes requests by conversation; Go rejects requests without the session header.
+    private static let openCodeSessionID = UUID().uuidString
+
+    private static func applyOpenCodeHeaders(to request: inout URLRequest, provider: CloudServiceProvider) {
+        guard provider == .opencode || provider == .opencodeGo else { return }
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0"
+        request.setValue(openCodeSessionID, forHTTPHeaderField: "x-opencode-session")
+        request.setValue("OpenClip/\(version)", forHTTPHeaderField: "User-Agent")
+    }
+
+    // MARK: - OpenAI-compatible chat completions
+
+    private func streamOpenAICompatible(systemPrompt: String, messages: [AIChatMessage], baseURL: String) -> AsyncThrowingStream<String, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    let base = baseURL.hasSuffix("/") ? String(baseURL.dropLast()) : baseURL
+                    let endpoint = "\(base)/chat/completions"
+                    guard let url = URL(string: endpoint) else {
+                        continuation.finish(throwing: AIError.invalidURL(endpoint))
+                        return
+                    }
+
+                    var request = URLRequest(url: url, timeoutInterval: AIRequestSupport.timeoutInterval)
+                    request.httpMethod = "POST"
+                    request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+                    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                    Self.applyOpenCodeHeaders(to: &request, provider: serviceProvider)
+
+                    let systemRole = isOpenAIReasoningModel(model) ? "developer" : "system"
+                    let body = OpenAIChatRequest(
+                        model: model,
+                        messages: [.init(role: systemRole, content: systemPrompt)]
+                            + messages.map { .init(role: $0.role.rawValue, content: $0.content) },
+                        stream: true
+                    )
+                    request.httpBody = try JSONEncoder().encode(body)
+
+                    let (bytes, response) = try await URLSession.shared.bytes(for: request)
+                    guard let http = response as? HTTPURLResponse else {
+                        continuation.finish(throwing: AIError.invalidResponse)
+                        return
+                    }
+                    guard http.statusCode == 200 else {
+                        var errorBytes = Data()
+                        for try await byte in bytes {
+                            errorBytes.append(byte)
+                            if errorBytes.count > 1024 { break }
+                        }
+                        let httpError = AIRequestSupport.httpErrorMessage(status: http.statusCode, data: errorBytes)
+                        Log.ai.error("OpenAI-compatible request failed: \(httpError.localizedDescription)")
+                        continuation.finish(throwing: httpError)
+                        return
+                    }
+
+                    struct StreamChunk: Decodable {
+                        struct Choice: Decodable {
+                            struct Delta: Decodable {
+                                let content: String?
+                            }
+                            let delta: Delta?
+                        }
+                        let choices: [Choice]?
+                    }
+
+                    for try await line in bytes.lines {
+                        guard !Task.isCancelled else { break }
+                        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard trimmed.hasPrefix("data:") else { continue }
+                        let dataStr = String(trimmed.dropFirst(5)).trimmingCharacters(in: .whitespacesAndNewlines)
+                        if dataStr == "[DONE]" { break }
+                        guard let chunkData = dataStr.data(using: .utf8) else { continue }
+                        if let decoded = try? JSONDecoder().decode(StreamChunk.self, from: chunkData),
+                           let content = decoded.choices?.first?.delta?.content, !content.isEmpty {
+                            continuation.yield(content)
+                        }
+                    }
+                    AIRequestSupport.finishStream(continuation)
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in
+                task.cancel()
+            }
+        }
+    }
+
+    // MARK: - Anthropic Messages API
+
+    private func streamAnthropic(systemPrompt: String, messages: [AIChatMessage]) -> AsyncThrowingStream<String, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    let base = effectiveBaseURL.hasSuffix("/") ? String(effectiveBaseURL.dropLast()) : effectiveBaseURL
+                    let endpoint = "\(base)/messages"
+                    guard let url = URL(string: endpoint) else {
+                        continuation.finish(throwing: AIError.invalidURL(endpoint))
+                        return
+                    }
+
+                    var request = URLRequest(url: url, timeoutInterval: AIRequestSupport.timeoutInterval)
+                    request.httpMethod = "POST"
+                    request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+                    request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+                    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+                    let body = AnthropicMessagesRequest(
+                        model: model,
+                        maxTokens: 4096,
+                        system: systemPrompt,
+                        messages: messages.map { .init(role: $0.role.rawValue, content: $0.content) },
+                        stream: true
+                    )
+                    request.httpBody = try JSONEncoder().encode(body)
+
+                    let (bytes, response) = try await URLSession.shared.bytes(for: request)
+                    guard let http = response as? HTTPURLResponse else {
+                        continuation.finish(throwing: AIError.invalidResponse)
+                        return
+                    }
+                    guard http.statusCode == 200 else {
+                        var errorBytes = Data()
+                        for try await byte in bytes {
+                            errorBytes.append(byte)
+                            if errorBytes.count > 1024 { break }
+                        }
+                        let httpError = AIRequestSupport.httpErrorMessage(status: http.statusCode, data: errorBytes)
+                        Log.ai.error("Anthropic request failed: \(httpError.localizedDescription)")
+                        continuation.finish(throwing: httpError)
+                        return
+                    }
+
+                    struct AnthropicDeltaEvent: Decodable {
+                        struct Delta: Decodable {
+                            let type: String?
+                            let text: String?
+                        }
+                        let type: String?
+                        let delta: Delta?
+                    }
+
+                    for try await line in bytes.lines {
+                        guard !Task.isCancelled else { break }
+                        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard trimmed.hasPrefix("data:") else { continue }
+                        let dataStr = String(trimmed.dropFirst(5)).trimmingCharacters(in: .whitespacesAndNewlines)
+                        if dataStr == "[DONE]" { break }
+                        guard let chunkData = dataStr.data(using: .utf8) else { continue }
+                        if let decoded = try? JSONDecoder().decode(AnthropicDeltaEvent.self, from: chunkData),
+                           let text = decoded.delta?.text, !text.isEmpty {
+                            continuation.yield(text)
+                        }
+                    }
+                    AIRequestSupport.finishStream(continuation)
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in
+                task.cancel()
+            }
+        }
+    }
+
+    // MARK: - Google Gemini API
+
+    private func streamGemini(systemPrompt: String, messages: [AIChatMessage]) -> AsyncThrowingStream<String, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    let base = effectiveBaseURL.hasSuffix("/") ? String(effectiveBaseURL.dropLast()) : effectiveBaseURL
+                    let encodedModel = model.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? model
+                    let endpoint = "\(base)/models/\(encodedModel):streamGenerateContent?alt=sse"
+                    guard let url = URL(string: endpoint) else {
+                        continuation.finish(throwing: AIError.invalidURL(endpoint))
+                        return
+                    }
+
+                    var request = URLRequest(url: url, timeoutInterval: AIRequestSupport.timeoutInterval)
+                    request.httpMethod = "POST"
+                    request.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
+                    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+                    let body = GeminiChatRequest(
+                        systemInstruction: .init(parts: [.init(text: systemPrompt)]),
+                        contents: messages.map { .init(role: $0.role == .assistant ? "model" : "user", parts: [.init(text: $0.content)]) }
+                    )
+                    request.httpBody = try JSONEncoder().encode(body)
+
+                    let (bytes, response) = try await URLSession.shared.bytes(for: request)
+                    guard let http = response as? HTTPURLResponse else {
+                        continuation.finish(throwing: AIError.invalidResponse)
+                        return
+                    }
+                    guard http.statusCode == 200 else {
+                        var errorBytes = Data()
+                        for try await byte in bytes {
+                            errorBytes.append(byte)
+                            if errorBytes.count > 1024 { break }
+                        }
+                        let httpError = AIRequestSupport.httpErrorMessage(status: http.statusCode, data: errorBytes)
+                        Log.ai.error("Gemini request failed: \(httpError.localizedDescription)")
+                        continuation.finish(throwing: httpError)
+                        return
+                    }
+
+                    for try await line in bytes.lines {
+                        guard !Task.isCancelled else { break }
+                        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard trimmed.hasPrefix("data:") else { continue }
+                        let dataStr = String(trimmed.dropFirst(5)).trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard let chunkData = dataStr.data(using: .utf8) else { continue }
+                        if let decoded = try? JSONDecoder().decode(GeminiChatResponse.self, from: chunkData),
+                           let text = decoded.candidates?.first?.content?.parts?.first?.text, !text.isEmpty {
+                            continuation.yield(text)
+                        }
+                    }
+                    AIRequestSupport.finishStream(continuation)
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in
+                task.cancel()
+            }
+        }
+    }
+
+    public static func fetchAvailableModels(apiKey: String, provider: CloudServiceProvider, customBaseURL: String = "") async throws -> [String] {
+        let trimmedKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedKey.isEmpty || provider == .openrouter else {
+            throw AIError.missingAPIKey
+        }
+
+        let baseURL = resolveBaseURL(provider: provider, customBaseURL: customBaseURL)
+        switch provider {
+        case .anthropic:
+            return try await fetchAnthropicModels(apiKey: trimmedKey, baseURL: baseURL)
+        case .google:
+            return try await fetchGeminiModels(apiKey: trimmedKey, baseURL: baseURL)
+        case .openai, .deepseek, .groq, .openrouter, .opencode, .opencodeGo, .mistral, .xai, .cerebras, .together, .fireworks, .custom:
+            return try await fetchOpenAICompatibleModels(apiKey: trimmedKey, baseURL: baseURL, provider: provider)
+        }
+    }
+
+    private static func fetchOpenAICompatibleModels(apiKey: String, baseURL: String, provider: CloudServiceProvider) async throws -> [String] {
+        let base = baseURL.hasSuffix("/") ? String(baseURL.dropLast()) : baseURL
+        let endpoint = "\(base)/models"
+        guard let url = URL(string: endpoint) else {
+            throw AIError.invalidURL(endpoint)
+        }
+        var request = URLRequest(url: url, timeoutInterval: 10)
+        if !apiKey.isEmpty {
+            request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        }
+        applyOpenCodeHeaders(to: &request, provider: provider)
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            throw AIError.invalidResponse
+        }
+
+        struct ModelListResponse: Decodable {
+            struct ModelItem: Decodable {
+                let id: String
+                let created: Int?
+            }
+            let data: [ModelItem]?
+        }
+
+        let decoded = try JSONDecoder().decode(ModelListResponse.self, from: data)
+        let entries = (decoded.data ?? []).map { CloudModelEntry(id: $0.id, created: $0.created) }
+        let chat = entries.filter { CloudModelCatalog.isChatModel($0.id) }
+        return CloudModelCatalog.ordered(chat.isEmpty ? entries : chat)
+    }
+
+    private static func fetchAnthropicModels(apiKey: String, baseURL: String) async throws -> [String] {
+        let base = baseURL.hasSuffix("/") ? String(baseURL.dropLast()) : baseURL
+        let endpoint = "\(base)/models"
+        guard let url = URL(string: endpoint) else {
+            throw AIError.invalidURL(endpoint)
+        }
+        var request = URLRequest(url: url, timeoutInterval: 10)
+        request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+        request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            throw AIError.invalidResponse
+        }
+
+        struct AnthropicModelListResponse: Decodable {
+            struct ModelItem: Decodable {
+                let id: String
+            }
+            let data: [ModelItem]?
+        }
+
+        // Anthropic already returns newest first, so the order is kept.
+        let decoded = try JSONDecoder().decode(AnthropicModelListResponse.self, from: data)
+        return (decoded.data ?? []).map { $0.id }
+    }
+
+    private static func fetchGeminiModels(apiKey: String, baseURL: String) async throws -> [String] {
+        let base = baseURL.hasSuffix("/") ? String(baseURL.dropLast()) : baseURL
+        let endpoint = "\(base)/models"
+        guard let url = URL(string: endpoint) else {
+            throw AIError.invalidURL(endpoint)
+        }
+        var request = URLRequest(url: url, timeoutInterval: 10)
+        request.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            throw AIError.invalidResponse
+        }
+
+        struct GeminiModelListResponse: Decodable {
+            struct ModelItem: Decodable {
+                let name: String
+                let supportedGenerationMethods: [String]?
+            }
+            let models: [ModelItem]?
+        }
+
+        let decoded = try JSONDecoder().decode(GeminiModelListResponse.self, from: data)
+        let entries = (decoded.models ?? [])
+            .filter { $0.supportedGenerationMethods?.contains("generateContent") ?? true }
+            .map { CloudModelEntry(id: $0.name.replacingOccurrences(of: "models/", with: ""), created: nil) }
+            .filter { $0.id.contains("gemini") && CloudModelCatalog.isChatModel($0.id) }
+
+        let ids = CloudModelCatalog.ordered(entries)
+        return ids.isEmpty ? CloudServiceProvider.google.defaultModels : ids
+    }
+}

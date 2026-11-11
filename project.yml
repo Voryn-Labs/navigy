@@ -1,0 +1,134 @@
+name: Navigy
+options:
+  bundleIdPrefix: app.navigy
+  developmentLanguage: en
+  knownRegions: [en, Base, zh-Hans, zh-Hant, fr, ja]
+targets:
+  Core:
+    type: framework
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources: [Sources/Core]
+    dependencies:
+      - sdk: NaturalLanguage.framework
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGN_STYLE: Automatic
+        ENABLE_HARDENED_RUNTIME: true
+        SWIFT_VERSION: "6.0"
+        SWIFT_STRICT_CONCURRENCY: complete
+  Navigy:
+    type: application
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources: [Sources/OpenClip]
+    info:
+      path: Sources/OpenClip/Info.plist
+      properties:
+        CFBundleURLTypes:
+          - CFBundleURLName: app.navigy.url
+            CFBundleURLSchemes:
+              - navigy
+              - openclip
+        CFBundleDocumentTypes:
+          - CFBundleTypeName: OpenClip Extension
+            CFBundleTypeRole: Viewer
+            LSHandlerRank: Alternate
+            LSItemContentTypes:
+              - com.openclip.extension
+            LSTypeIsPackage: true
+        UTImportedTypeDeclarations:
+          - UTTypeIdentifier: com.openclip.extension
+            UTTypeDescription: OpenClip Extension
+            UTTypeConformsTo:
+              - com.apple.package
+              - public.composite-content
+            UTTypeTagSpecification:
+              public.filename-extension:
+                - openclipext
+        LSUIElement: true
+        NSHumanReadableCopyright: "Copyright © 2026 Ganesh M and OpenClip Contributors. AGPL-3.0 licensed."
+        NSAppleEventsUsageDescription: "Navigy needs to control other apps to run your AppleScript actions and to paste results back into the app you were using."
+        CFBundleLocalizations:
+          - en
+          - zh-Hans
+          - zh-Hant
+          - fr
+          - ja
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        MARKETING_VERSION: "1.10.0"
+        CURRENT_PROJECT_VERSION: "27"
+        INFOPLIST_KEY_CFBundleShortVersionString: $(MARKETING_VERSION)
+        INFOPLIST_KEY_CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        CODE_SIGN_ENTITLEMENTS: Sources/OpenClip/OpenClip.entitlements
+        PRODUCT_MODULE_NAME: OpenClip
+        # Ad-hoc is the default so a clone builds and runs with no Apple Developer account.
+        # scripts/sign_artifact.sh overrides the identity for signed/notarized builds.
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: ""
+        ENABLE_HARDENED_RUNTIME: true
+        SWIFT_VERSION: "6.0"
+        SWIFT_STRICT_CONCURRENCY: complete
+        SWIFT_EMIT_LOC_STRINGS: YES
+        LOCALIZATION_PREFERS_STRING_CATALOGS: YES
+      configs:
+        Debug:
+          ENABLE_HARDENED_RUNTIME: false
+          PRODUCT_BUNDLE_IDENTIFIER: app.navigy.Navigy.dev
+          INFOPLIST_KEY_CFBundleDisplayName: Navigy Dev
+        Release:
+          PRODUCT_BUNDLE_IDENTIFIER: app.navigy.Navigy
+          INFOPLIST_KEY_CFBundleDisplayName: Navigy
+    dependencies:
+      - target: Core
+      - package: OpenSelection
+      - package: KeyboardShortcuts
+      - package: SDWebImageSwiftUI
+      - package: SDWebImageSVGCoder
+  OpenClipTests:
+    type: bundle.unit-test
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources: [Tests/OpenClipTests]
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_VERSION: "6.0"
+        SWIFT_STRICT_CONCURRENCY: complete
+    dependencies:
+      - target: Navigy
+      - package: OpenSelection
+schemes:
+  Navigy:
+    build:
+      targets:
+        Navigy: all
+    test:
+      targets:
+        - OpenClipTests
+  OpenClipTests:
+    build:
+      targets:
+        Navigy: [test]
+    test:
+      targets:
+        - OpenClipTests
+packages:
+  OpenSelection:
+    url: https://github.com/ganeshmshetty/OpenSelection.git
+    exactVersion: 2.16.1
+  KeyboardShortcuts:
+    url: https://github.com/sindresorhus/KeyboardShortcuts
+    from: 3.1.0
+  SDWebImageSwiftUI:
+    url: https://github.com/SDWebImage/SDWebImageSwiftUI
+    from: 3.0.0
+  SDWebImageSVGCoder:
+    url: https://github.com/SDWebImage/SDWebImageSVGCoder
+    from: 1.7.0

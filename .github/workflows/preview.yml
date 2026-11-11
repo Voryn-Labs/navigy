@@ -1,0 +1,26 @@
+name: Package macOS preview
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Build and package
+        env:
+          OPENCLIP_SIGN_IDENTITY: "-"
+        run: ./scripts/package_app.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Navigy-macOS-preview
+          path: |
+            build/Navigy.zip
+            build/Navigy.dmg
+          if-no-files-found: error
