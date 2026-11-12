@@ -23,6 +23,24 @@ struct AboutTab: View {
                 // Identity block
                 identityBlock
 
+                SettingsCard("Voryn Labs") {
+                    HStack(spacing: 12) {
+                        Image("VorynLabsLogo")
+                            .resizable()
+                            .scaledToFit()
+                            .frame(width: 40, height: 40)
+                            .clipShape(RoundedRectangle(cornerRadius: 9))
+                            .accessibilityHidden(true)
+                        VStack(alignment: .leading, spacing: 4) {
+                            Link("voryn-labs.github.io", destination: URL(string: "https://voryn-labs.github.io/")!)
+                            Link("GitHub", destination: URL(string: "https://github.com/Voryn-Labs")!)
+                                .font(.caption)
+                        }
+                        Spacer()
+                    }
+                    .padding(12)
+                }
+
                 // Diagnostics
                 SettingsCard("Diagnostics") {
                     SettingsRow(

@@ -53,5 +53,17 @@ jobs:
           
           This preview is ad-hoc signed and has no Apple notarization. Gatekeeper may block the download. To build a local copy, see the [Xcode instructions](https://github.com/Voryn-Labs/navigy#build-and-run).
           NOTES
-          gh release create "v$version-preview" release/Navigy.dmg release/Navigy.zip release/SHA256SUMS.txt \
+          if [[ "$version" == "1.0.0" ]]; then
+            cat > release-notes.md <<'NOTES'
+          Navigy v1 for Apple Silicon and Intel Macs running macOS 14 or later. Download **Navigy.dmg** to install.
+
+          Published by [Voryn Labs](https://voryn-labs.github.io/). The app’s About screen includes the studio’s logo and links.
+
+          This release is ad-hoc signed and has no Apple notarization. Gatekeeper may block the download. For a local build, see the [Xcode instructions](https://github.com/Voryn-Labs/navigy#build-and-run).
+          NOTES
+            gh release create v1.0.0 release/Navigy.dmg release/Navigy.zip release/SHA256SUMS.txt \
+              --target "$BUILD_COMMIT" --title "Navigy v1" --latest --notes-file release-notes.md
+          else
+            gh release create "v$version-preview" release/Navigy.dmg release/Navigy.zip release/SHA256SUMS.txt \
             --target "$BUILD_COMMIT" --title "Navigy $version Preview" --prerelease --notes-file release-notes.md
+          fi

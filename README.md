@@ -29,6 +29,12 @@ The local preview uses ad-hoc signing. macOS ties an Accessibility grant to the 
 
 After switching from ad-hoc signing to a certificate, grant Accessibility once for the newly signed app.
 
+## Voryn Labs
+
+<a href="https://voryn-labs.github.io/"><img src="Sources/OpenClip/Assets.xcassets/VorynLabsLogo.imageset/VorynLabsLogo.png" alt="Voryn Labs" width="40"></a>
+
+[Voryn Labs website](https://voryn-labs.github.io/) · [GitHub organization](https://github.com/Voryn-Labs)
+
 ## Upstream
 
 This is a modified build of [OpenClip](https://github.com/ganeshmshetty/openclip), based on commit [88c381a](https://github.com/ganeshmshetty/openclip/commit/88c381a8e74c56804b0f88f3a0667e48c118811b). It retains the original notices and [AGPL-3.0 license](LICENSE).
